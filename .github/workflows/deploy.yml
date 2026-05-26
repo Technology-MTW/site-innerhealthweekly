@@ -11,3 +11,4 @@ jobs:
     secrets: inherit
     with:
       base_domain: ${{ vars.BASE_DOMAIN }}
+      
