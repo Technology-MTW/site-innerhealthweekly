@@ -1,4 +1,4 @@
-name: Deploy Website
+name: Deploy Website via SFTP
 
 on:
   push:
@@ -7,7 +7,233 @@ on:
 
 jobs:
   deploy:
-    uses: XMX-TI/infra-workflows/.github/workflows/deploy-orange.yml@main
-    secrets: inherit
-    with:
-      base_domain: ${{ vars.BASE_DOMAIN }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve deploy target
+        id: resolve_target
+        shell: bash
+        run: |
+          echo "================ DEPLOY RESOLVE START ================"
+          echo "GITHUB_EVENT_NAME: ${GITHUB_EVENT_NAME}"
+          echo "GITHUB_REF: ${GITHUB_REF}"
+          echo "GITHUB_REF_NAME: ${GITHUB_REF_NAME}"
+          echo "GITHUB_SHA: ${GITHUB_SHA}"
+
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+          BASE_DOMAIN="${{ vars.BASE_DOMAIN }}"
+
+          if [[ -z "${BASE_DOMAIN}" ]]; then
+            echo "Erro: configure a variavel de repositorio BASE_DOMAIN."
+            exit 1
+          fi
+
+          BASE_DOMAIN_NORMALIZED="$(echo "${BASE_DOMAIN}" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/$##')"
+          DOMAIN_HOST="$(echo "${BASE_DOMAIN_NORMALIZED}" | sed -E 's#^www\.##')"
+          SSH_ENV="${{ secrets.SSH_ENV }}"
+          ACCOUNT_NAME="${SSH_ENV}"
+
+          if [[ -z "${ACCOUNT_NAME}" ]]; then
+            echo "Erro: configure secrets.SSH_ENV com o usuario cPanel."
+            exit 1
+          fi
+
+          BASE_PATH="/home/${ACCOUNT_NAME}/public_html"
+
+          echo "Resolved BRANCH_NAME: ${BRANCH_NAME}"
+          echo "Resolved ACCOUNT_NAME from SSH_ENV."
+          echo "Configured BASE_PATH: ${BASE_PATH}"
+          echo "Configured BASE_DOMAIN: ${BASE_DOMAIN}"
+          echo "Normalized BASE_DOMAIN: ${BASE_DOMAIN_NORMALIZED}"
+          echo "Resolved DOMAIN_HOST: ${DOMAIN_HOST}"
+
+          if [[ "${BRANCH_NAME}" == "main" ]]; then
+            echo "Branch is main. Deploy target will be root public_html."
+            TARGET_PATH="${BASE_PATH}/"
+          else
+            echo "Branch is not main. Deploy target will include subdomain."
+            BRANCH_SLUG="$(echo "${BRANCH_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9-]+#-#g; s#^-+##; s#-+$##')"
+            echo "Generated BRANCH_SLUG: ${BRANCH_SLUG}"
+
+            if [[ -z "${BRANCH_SLUG}" ]]; then
+              echo "Erro: nao foi possivel gerar um slug valido para a branch ${BRANCH_NAME}."
+              exit 1
+            fi
+
+            TARGET_PATH="${BASE_PATH}/${BRANCH_SLUG}.${DOMAIN_HOST}/"
+          fi
+
+          echo "branch_name=${BRANCH_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "target_path=${TARGET_PATH}" >> "${GITHUB_OUTPUT}"
+          echo "account_name=${ACCOUNT_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "Deploy branch: ${BRANCH_NAME}"
+          echo "Deploy target: ${TARGET_PATH}"
+          echo "================ DEPLOY RESOLVE END =================="
+
+      - name: Pre-deploy fix and validation
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+
+            ACCOUNT_NAME="${{ steps.resolve_target.outputs.account_name }}"
+            BASE_PATH="/home/${ACCOUNT_NAME}/public_html"
+            TARGET_PATH="${{ steps.resolve_target.outputs.target_path }}"
+
+            echo "===== PRE-DEPLOY FIX ====="
+            mkdir -p "${BASE_PATH}"
+            mkdir -p "${TARGET_PATH}"
+            mkdir -p "${BASE_PATH}/.well-known"
+
+            chown -R "${ACCOUNT_NAME}:${ACCOUNT_NAME}" "${BASE_PATH}"
+            find "${BASE_PATH}" -type d -exec chmod 755 {} \;
+            find "${BASE_PATH}" -type f -exec chmod 644 {} \;
+            chmod 711 "/home/${ACCOUNT_NAME}"
+            chown -R "${ACCOUNT_NAME}:${ACCOUNT_NAME}" "${BASE_PATH}/.well-known"
+
+            echo "===== PRE-DEPLOY DEBUG ====="
+            ls -ld "/home/${ACCOUNT_NAME}"
+            ls -ld "${BASE_PATH}"
+            ls -ld "${BASE_PATH}/.well-known"
+            ls -ld "${TARGET_PATH}"
+            namei -om "${BASE_PATH}/.well-known" || true
+
+            HOME_OWNER="$(stat -c '%U:%G' "/home/${ACCOUNT_NAME}")"
+            BASE_OWNER="$(stat -c '%U:%G' "${BASE_PATH}")"
+            TARGET_OWNER="$(stat -c '%U:%G' "${TARGET_PATH}")"
+            WELLKNOWN_OWNER="$(stat -c '%U:%G' "${BASE_PATH}/.well-known")"
+
+            echo "HOME_OWNER=${HOME_OWNER}"
+            echo "BASE_OWNER=${BASE_OWNER}"
+            echo "TARGET_OWNER=${TARGET_OWNER}"
+            echo "WELLKNOWN_OWNER=${WELLKNOWN_OWNER}"
+
+            [[ "${HOME_OWNER}" == "${ACCOUNT_NAME}:${ACCOUNT_NAME}" ]] || { echo "Erro: owner incorreto em /home/${ACCOUNT_NAME}"; exit 1; }
+            [[ "${BASE_OWNER}" == "${ACCOUNT_NAME}:${ACCOUNT_NAME}" ]] || { echo "Erro: owner incorreto em ${BASE_PATH}"; exit 1; }
+            [[ "${TARGET_OWNER}" == "${ACCOUNT_NAME}:${ACCOUNT_NAME}" ]] || { echo "Erro: owner incorreto em ${TARGET_PATH}"; exit 1; }
+            [[ "${WELLKNOWN_OWNER}" == "${ACCOUNT_NAME}:${ACCOUNT_NAME}" ]] || { echo "Erro: owner incorreto em ${BASE_PATH}/.well-known"; exit 1; }
+
+      - name: Deploy to SFTP
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          source: "."
+          target: ${{ steps.resolve_target.outputs.target_path }}
+
+      - name: Post-deploy validation and conditional fix
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+
+            ACCOUNT_NAME="${{ steps.resolve_target.outputs.account_name }}"
+            BASE_PATH="/home/${ACCOUNT_NAME}/public_html"
+            TARGET_PATH="${{ steps.resolve_target.outputs.target_path }}"
+            WELLKNOWN_PATH="${BASE_PATH}/.well-known"
+            EXPECTED_OWNER="${ACCOUNT_NAME}:${ACCOUNT_NAME}"
+
+            print_debug() {
+              echo "===== DEBUG PERMISSIONS ====="
+              echo "Home directory:"
+              ls -ld "/home/${ACCOUNT_NAME}" || true
+
+              echo "Public_html:"
+              ls -ld "${BASE_PATH}" || true
+
+              echo ".well-known:"
+              ls -ld "${WELLKNOWN_PATH}" || true
+
+              echo "Target path:"
+              ls -ld "${TARGET_PATH}" || true
+
+              echo "Path breakdown:"
+              namei -om "${WELLKNOWN_PATH}" || true
+
+              echo "Sample files:"
+              ls -la "${TARGET_PATH}" | head -n 20 || true
+              echo "===== END DEBUG ====="
+            }
+
+            get_owner() {
+              stat -c '%U:%G' "$1"
+            }
+
+            mkdir -p "${WELLKNOWN_PATH}"
+            mkdir -p "${TARGET_PATH}"
+
+            HOME_OWNER="$(get_owner "/home/${ACCOUNT_NAME}")"
+            BASE_OWNER="$(get_owner "${BASE_PATH}")"
+            TARGET_OWNER="$(get_owner "${TARGET_PATH}")"
+            WELLKNOWN_OWNER="$(get_owner "${WELLKNOWN_PATH}")"
+
+            echo "===== POST-DEPLOY OWNER CHECK ====="
+            echo "EXPECTED_OWNER=${EXPECTED_OWNER}"
+            echo "HOME_OWNER=${HOME_OWNER}"
+            echo "BASE_OWNER=${BASE_OWNER}"
+            echo "TARGET_OWNER=${TARGET_OWNER}"
+            echo "WELLKNOWN_OWNER=${WELLKNOWN_OWNER}"
+
+            NEED_FIX=0
+
+            [[ "${HOME_OWNER}" == "${EXPECTED_OWNER}" ]] || NEED_FIX=1
+            [[ "${BASE_OWNER}" == "${EXPECTED_OWNER}" ]] || NEED_FIX=1
+            [[ "${TARGET_OWNER}" == "${EXPECTED_OWNER}" ]] || NEED_FIX=1
+            [[ "${WELLKNOWN_OWNER}" == "${EXPECTED_OWNER}" ]] || NEED_FIX=1
+
+            if [[ "${NEED_FIX}" -eq 1 ]]; then
+              echo "Owner incorreto detectado. Aplicando correcao..."
+
+              chown -R "${ACCOUNT_NAME}:${ACCOUNT_NAME}" "${BASE_PATH}"
+              find "${BASE_PATH}" -type d -exec chmod 755 {} \;
+              find "${BASE_PATH}" -type f -exec chmod 644 {} \;
+              chmod 711 "/home/${ACCOUNT_NAME}"
+              mkdir -p "${WELLKNOWN_PATH}"
+              chown -R "${ACCOUNT_NAME}:${ACCOUNT_NAME}" "${WELLKNOWN_PATH}"
+
+              echo "Correcao aplicada. Revalidando..."
+            else
+              echo "Owners corretos. Nenhuma correcao necessaria."
+            fi
+
+            HOME_OWNER="$(get_owner "/home/${ACCOUNT_NAME}")"
+            BASE_OWNER="$(get_owner "${BASE_PATH}")"
+            TARGET_OWNER="$(get_owner "${TARGET_PATH}")"
+            WELLKNOWN_OWNER="$(get_owner "${WELLKNOWN_PATH}")"
+
+            echo "===== POST-DEPLOY FINAL CHECK ====="
+            echo "EXPECTED_OWNER=${EXPECTED_OWNER}"
+            echo "HOME_OWNER=${HOME_OWNER}"
+            echo "BASE_OWNER=${BASE_OWNER}"
+            echo "TARGET_OWNER=${TARGET_OWNER}"
+            echo "WELLKNOWN_OWNER=${WELLKNOWN_OWNER}"
+
+            print_debug
+
+            [[ "${HOME_OWNER}" == "${EXPECTED_OWNER}" ]] || { echo "Erro: owner incorreto em /home/${ACCOUNT_NAME}"; exit 1; }
+            [[ "${BASE_OWNER}" == "${EXPECTED_OWNER}" ]] || { echo "Erro: owner incorreto em ${BASE_PATH}"; exit 1; }
+            [[ "${TARGET_OWNER}" == "${EXPECTED_OWNER}" ]] || { echo "Erro: owner incorreto em ${TARGET_PATH}"; exit 1; }
+            [[ "${WELLKNOWN_OWNER}" == "${EXPECTED_OWNER}" ]] || { echo "Erro: owner incorreto em ${WELLKNOWN_PATH}"; exit 1; }
+
+      - name: Deploy finished
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          echo "================ DEPLOY DONE ========================="
+          echo "Deploy completed with success."
+          echo "Branch: ${{ steps.resolve_target.outputs.branch_name }}"
+          echo "Target: ${{ steps.resolve_target.outputs.target_path }}"
+          echo "======================================================"
