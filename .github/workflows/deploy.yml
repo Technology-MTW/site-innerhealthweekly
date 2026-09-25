@@ -1,6 +1,7 @@
 name: Deploy Website
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - "**"
@@ -8,7 +9,7 @@ on:
 jobs:
   deploy:
 <<<<<<< HEAD
-    uses: XMX-TI/infra-workflows/.github/workflows/deploy-orange.yml@main
+    uses: Technology-MTW/infra-workflows/.github/workflows/deploy-orange.yml@main
     secrets: inherit
     with:
       base_domain: ${{ vars.BASE_DOMAIN }}
